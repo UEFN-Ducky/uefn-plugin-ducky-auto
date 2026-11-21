@@ -82,11 +82,63 @@ def _rate(bad: int, total: int) -> float:
     return round(bad / total, 3) if total else 0.0
 
 
-def summary(rows: list[dict], baseline_prices: tuple | None = None, baseline_model: str = "") -> dict:
-    """Totals, per model, per task, and savings.
+def switch_audit(rows: list[dict], prices_of) -> dict:
+    """Did each model switch actually pay for itself? Rows oldest first.
 
-    ``baseline_prices``: the best-quality model's prices; what the same steps would cost on it,
-    uncached, is the "without Ducky Auto" figure. None = no dollar savings (no prices known).
+    A switch re-reads the chat on the new model (its uncached input on that step). From the switch
+    until the chat moves again, each step's real cost is set against the same tokens on the model it
+    left, with that step's input read from cache as staying would have (the old model's cache was warm).
+    ``prices_of("gateway:model")`` → (in, out, cached_in) or None.
+    """
+    open_: dict[str, dict] = {}
+    done: list[dict] = []  # in the order the switches happened
+    for r in rows:
+        chat = str(r.get("chat") or "")
+        here = f"{r.get('gateway', '')}:{r.get('model', '')}"
+        seg = open_.get(chat)
+        if seg and (seg["model"] != here or r.get("decision") == "switched"):
+            open_.pop(chat)
+            seg = None
+        if r.get("decision") == "switched" and r.get("previous"):
+            tin, _out, tcached = tokens_of(r.get("usage") or {})
+            seg = open_[chat] = {"chat": chat, "from": r["previous"], "model": here, "why": r.get("why", ""),
+                                 "reread_tokens": max(0, tin - tcached), "steps": 0, "actual": 0.0,
+                                 "stay": 0.0, "priced": True, "_old": prices_of(r["previous"])}
+            done.append(seg)
+        if not seg:
+            continue
+        u = r.get("usage") or {}
+        tin, tout, tcached = tokens_of(u)
+        # Step 1 on the old model would have been cached; later steps get the cache share it really had.
+        stay_u = {"input_tokens": tin, "output_tokens": tout,
+                  "cache_read_tokens": tin if seg["steps"] == 0 else tcached}
+        stay = cost_usd(stay_u, seg["_old"])
+        cost = r.get("cost_usd")
+        seg["steps"] += 1
+        if stay is None or not isinstance(cost, (int, float)):
+            seg["priced"] = False
+        else:
+            seg["actual"] += cost
+            seg["stay"] += stay
+    out = []
+    for s in done:
+        s.pop("_old")
+        s["net_usd"] = round(s["stay"] - s["actual"], 6) if s["priced"] else None
+        s["actual"], s["stay"] = round(s["actual"], 6), round(s["stay"], 6)
+        out.append(s)
+    priced = [s for s in out if s["net_usd"] is not None]
+    return {"switches": out, "count": len(out), "priced": len(priced),
+            "paid_off": sum(1 for s in priced if s["net_usd"] > 0),
+            "net_usd": round(sum(s["net_usd"] for s in priced), 6) if priced else None,
+            "reread_tokens": sum(s["reread_tokens"] for s in out)}
+
+
+def summary(rows: list[dict], baseline_prices: tuple | None = None, baseline_model: str = "",
+            prices_of=None) -> dict:
+    """Totals, per model, per task, savings and (with ``prices_of``) the switch audit.
+
+    ``baseline_prices``: the best-quality model's prices; the same steps on it, with the same cache
+    hits, is the "without Ducky Auto" figure. None = no dollar savings (no prices known).
     """
     by_model: dict[str, dict] = defaultdict(lambda: {"steps": 0, "errors": 0, "input": 0, "output": 0,
                                                        "cached": 0, "cost_usd": 0.0, "ms": 0})
@@ -131,7 +183,7 @@ def summary(rows: list[dict], baseline_prices: tuple | None = None, baseline_mod
         if decision.startswith("stayed"):
             savings["stayed_tool_steps"] += 1
         if baseline_prices and isinstance(cost, (int, float)):
-            b = cost_usd({"input_tokens": tin, "output_tokens": tout}, baseline_prices)
+            b = cost_usd(r.get("usage") or {}, baseline_prices)
             if b is not None:
                 base_cost += b
                 actual_cost += cost
@@ -155,4 +207,7 @@ def summary(rows: list[dict], baseline_prices: tuple | None = None, baseline_mod
         savings["actual_cost_usd"] = round(actual_cost, 6)
         savings["saved_usd"] = round(base_cost - actual_cost, 6)
         savings["priced_steps"] = priced
-    return {"totals": totals, "by_model": dict(by_model), "by_task": dict(by_task), "savings": savings}
+    out = {"totals": totals, "by_model": dict(by_model), "by_task": dict(by_task), "savings": savings}
+    if prices_of:
+        out["switch_audit"] = switch_audit(rows, prices_of)
+    return out

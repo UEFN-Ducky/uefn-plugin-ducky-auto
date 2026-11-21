@@ -905,6 +905,7 @@
     const s = res.summary || {};
     const t = s.totals || {};
     const sv = s.savings || {};
+    const au = s.switch_audit || {};
     const tiles = [
       [num(t.steps), "steps routed", "fg"], [num(t.switches), "model switches", "fg"], [num(t.kept), "kept (cheaper to stay)", "fg"],
       [`${num(t.errors)} · ${pct(t.error_rate)}`, "errors", t.errors ? "red" : "fg"],
@@ -912,6 +913,10 @@
       [usd(t.cost_usd), t.priced_steps ? `cost (${num(t.priced_steps)} priced steps)` : "cost", "fg"],
       [sv.saved_usd == null ? "no prices yet" : usd(sv.saved_usd), sv.baseline_model ? `saved vs. ${sv.baseline_model}` : "saved", sv.saved_usd == null ? "muted" : "green"],
       [sv.cache_share == null ? "—" : pct(sv.cache_share), "input read from cache", "fg"],
+      [au.count ? `${num(au.paid_off)} of ${num(au.priced)}` : "no switches", "switches that paid for themselves",
+        !au.priced ? "muted" : au.paid_off === au.priced ? "green" : "amber"],
+      [au.net_usd == null ? (au.count ? "no prices" : "—") : `${au.net_usd < 0 ? "−" : "+"}${usd(Math.abs(au.net_usd))}`,
+        `switching vs. staying · ${fmtK(au.reread_tokens || 0)} tokens re-read`, au.net_usd == null ? "muted" : au.net_usd < 0 ? "red" : "green"],
     ].map(([v, l, c]) => `<div class="dka-tile"><b class="dka-c-${c}">${esc(v)}</b><span>${esc(l)}</span></div>`).join("");
     const errCell = (e, rate) => cell(`${num(e || 0)} · ${pct(rate || 0)}`, `dka-r${e ? " dka-c-red dka-strong" : ""}`);
     const byModel = Object.entries(s.by_model || {}).sort((a, b) => b[1].steps - a[1].steps).map(([k, v]) => [
@@ -928,6 +933,12 @@
         cell(fc, `dka-r ${fc ? "dka-c-red dka-strong" : "dka-muted"}`), cell(secs(r.ms), "dka-r"),
         cell(r.error ? String(r.error).slice(0, 120) : "—", r.error ? "dka-c-red" : "dka-muted")];
     });
+    const audit = (au.switches || []).slice(-40).reverse().map((w) => [
+      cell(w.from, "dka-mono dka-muted"), cell(w.model, "dka-mono"), cell(w.why || "", "dka-muted"),
+      cell(fmtK(w.reread_tokens), "dka-r"), cell(num(w.steps), "dka-r"), cell(w.priced ? usd(w.actual) : "—", "dka-r"),
+      cell(w.priced ? usd(w.stay) : "—", "dka-r"),
+      cell(w.net_usd == null ? "no prices" : `${w.net_usd < 0 ? "−" : "+"}${usd(Math.abs(w.net_usd))}`,
+        `dka-r dka-strong ${w.net_usd == null ? "dka-muted" : w.net_usd < 0 ? "dka-c-red" : "dka-c-green"}`)]);
     const sk = sankey(res.steps || []);
     body.innerHTML = `<div class="dka-col">
       <div class="dka-bar-row"><b>Last ${num(t.steps || 0)} steps</b><button type="button" class="dka-btn" data-refresh>Refresh</button><button type="button" class="dka-btn" data-clear>Clear log</button></div>
@@ -937,6 +948,9 @@
           <span class="dka-sk-cap" data-cap>Hover a band or a bar for numbers.</span></div>
         ${sk.html}
       </section>
+      ${gridTable({ title: "Did each switch pay off?", sub: "What the steps after a switch really cost, against the same steps on the model it left, read from its warm cache.",
+        cols: "minmax(170px,1.4fr) minmax(170px,1.4fr) minmax(140px,1.2fr) 80px 60px 80px 80px 90px", minW: "900px",
+        head: [["From"], ["To"], ["Why"], ["Re-read", 1], ["Steps", 1], ["Cost", 1], ["If stayed", 1], ["Net", 1]], rows: audit })}
       ${gridTable({ title: "Per model", cols: "minmax(200px,2fr) 60px 100px 70px 70px 70px 70px 80px", minW: "780px",
         head: [["Model"], ["Steps", 1], ["Errors · rate", 1], ["In", 1], ["Out", 1], ["Cached", 1], ["Cost", 1], ["Avg time", 1]], rows: byModel })}
       ${gridTable({ title: "Per task", cols: "minmax(140px,1.5fr) 60px 100px 70px 70px 60px 90px 80px", minW: "700px",

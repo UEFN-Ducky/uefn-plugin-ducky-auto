@@ -901,7 +901,11 @@ def register(api) -> None:
     def analytics(limit: int = 100, chat: str = "") -> dict:
         rows = log.rows(limit=max(1, min(int(limit or 100), 2000)), chat=str(chat or ""))
         name, base = baseline()
-        return {"ok": True, "summary": summary(rows, base, name), "steps": list(reversed(rows)),
+        def prices_of(route: str) -> tuple | None:
+            g, _, m = route.partition(":")
+            return prices(g, m) if g and m else None
+
+        return {"ok": True, "summary": summary(rows, base, name, prices_of), "steps": list(reversed(rows)),
                 "adjustments": adjustments()}
 
     def analytics_clear() -> dict:
