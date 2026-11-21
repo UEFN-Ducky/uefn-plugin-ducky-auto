@@ -12,7 +12,7 @@ ENDPOINT_PATH = "/api/v1/plugins/analytics/collect/events"
 EVENT_NAME = "plugin_usage"
 MAX_BATCH = 50  # the site's limit per request
 
-_TASKS = {"planning", "coding", "modeling", "execution", "research", "writing", "quick", "general"}
+_TASKS = {"planning", "coding", "modeling", "execution", "research", "writing", "quick", "long", "general"}
 _DECISIONS = {"first", "same", "switched", "kept", "stayed (tool step)", "kept (nothing else answered)"}
 # Public gateways keep their name; anything else (a self-hosted URL gateway) is "other".
 _GATEWAYS = {"anthropic", "openai", "gemini", "google", "spacexai", "kimi", "cursor", "ollama", "uefn_ducky", "opencode"}

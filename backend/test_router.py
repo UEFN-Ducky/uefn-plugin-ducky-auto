@@ -95,6 +95,10 @@ def test_long_chats_and_windows() -> None:
     assert explain_task("go on", "tool", r, context_tokens=500_000)[0] == "execution"  # tool steps stay
     assert explain_task("fix it", "user", merged_rules({"long_context": 0}), context_tokens=900_000)[0] != "long"
     assert not fits_window(130_000, 128_000) and fits_window(100_000, 128_000) and fits_window(10**6, None)
+    # Long chats is a real task: a model can be picked for it and its Auto tier sticks.
+    from router import all_tasks
+    assert "long" in all_tasks(r)
+    assert merged_rules({"auto_tier": {"long": "best"}})["auto_tier"]["long"] == "best"
 
 
 def test_examples() -> None:

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import re
 
-TASKS = ("planning", "coding", "modeling", "execution", "research", "writing", "quick", "general")
+TASKS = ("planning", "coding", "modeling", "execution", "research", "writing", "quick", "long", "general")
 KEYWORD_TASKS = ("modeling", "coding", "planning", "research", "writing", "quick")  # default order
 TIER_RANK = {"fast": 0, "balanced": 1, "best": 2}
 

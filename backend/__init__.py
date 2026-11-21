@@ -28,7 +28,7 @@ from .router import (
 
 SELF = "ducky_auto"
 MODEL_ID = "ducky-auto"
-VERSION = "1.14.0"
+VERSION = "1.14.1"
 _SHARE_EVERY = 10  # steps per upload
 _SHARE_MAX_WAIT_S = 300.0  # or this long after the first one waiting
 _SHARE_QUEUE_MAX = 200  # offline: keep at most this many, oldest dropped

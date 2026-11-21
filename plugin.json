@@ -1,7 +1,7 @@
 {
   "id": "ducky-auto",
   "kind": "plugin",
-  "version": "1.14.0",
+  "version": "1.14.1",
   "label": "Ducky Auto",
   "description": "Auto model router. Pick Ducky Auto in the chat model picker: each step goes to the model you chose for its kind of task, or Auto picks one. The rules (task order, keywords, model per task, thinking), the analytics and the change history are on its Settings \u2192 LLMs \u2192 Ducky Auto page, with a live Try a message preview. Every model answers a tiny check before it is used, a chat only moves to another model when that is cheaper than staying, the chat shows which model ran, and every step is logged for troubleshooting.",
   "min_app_version": "1.2.380",
