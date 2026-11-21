@@ -1,0 +1,154 @@
+{
+  "id": "ducky-auto",
+  "kind": "plugin",
+  "version": "1.13.0",
+  "label": "Ducky Auto",
+  "description": "Auto model router. Pick Ducky Auto in the chat model picker: each step goes to the model you chose for its kind of task, or Auto picks one. The rules (task order, keywords, model per task, thinking), the analytics and the change history are on its Settings \u2192 LLMs \u2192 Ducky Auto page, with a live Try a message preview. Every model answers a tiny check before it is used, a chat only moves to another model when that is cheaper than staying, the chat shows which model ran, and every step is logged for troubleshooting.",
+  "min_app_version": "1.2.380",
+  "default_enabled": true,
+  "data_sharing": false,
+  "secret_keys": [],
+  "contributes": {
+    "llm.providers": [
+      {
+        "id": "ducky_auto",
+        "label": "Ducky Auto",
+        "kind": "secret",
+        "key_optional": true,
+        "order": 1
+      }
+    ],
+    "shell.boot": [
+      {
+        "entry": "ui/page.js"
+      }
+    ],
+    "agent.tools": {
+      "category": "ducky_auto",
+      "intent_pattern": "\\bducky[ -]?auto\\b",
+      "plan_tools": [
+        "ducky_auto_route",
+        "ducky_auto_check_routes",
+        "ducky_auto_get_rules",
+        "ducky_auto_models",
+        "ducky_auto_analytics"
+      ],
+      "destructive_tools": [
+        "ducky_auto_analytics_clear",
+        "ducky_auto_reset_rules",
+        "ducky_auto_delete_rule",
+        "ducky_auto_setup",
+        "ducky_auto_tune",
+        "ducky_auto_set_model",
+        "ducky_auto_set_gateway",
+        "ducky_auto_save_rules",
+        "ducky_auto_add_rule"
+      ]
+    },
+    "automations": {
+      "nodes": [
+        {
+          "id": "ducky-auto.route",
+          "label": "Ducky Auto route",
+          "group": "Ducky Auto",
+          "description": "Which task a prompt is, the rule that matched, and the checked model Ducky Auto would use.",
+          "exec": false,
+          "inputs": [
+            {
+              "id": "prompt",
+              "label": "Prompt",
+              "type": "text",
+              "required": true
+            }
+          ],
+          "outputs": [
+            {
+              "id": "task",
+              "label": "Task",
+              "type": "text"
+            },
+            {
+              "id": "gateway",
+              "label": "Gateway",
+              "type": "text"
+            },
+            {
+              "id": "model",
+              "label": "Model",
+              "type": "text"
+            },
+            {
+              "id": "route",
+              "label": "Route",
+              "type": "json"
+            }
+          ]
+        }
+      ],
+      "templates": [
+        {
+          "id": "ducky-auto-route",
+          "label": "Ducky Auto: which model?",
+          "description": "Chat \u2192 Ducky Auto route \u2192 Finish.",
+          "graph": {
+            "nodes": [
+              {
+                "id": "s",
+                "type": "start.chat",
+                "x": 0,
+                "y": 0,
+                "config": {}
+              },
+              {
+                "id": "a",
+                "type": "pipeline.agent",
+                "x": 300,
+                "y": 0,
+                "config": {
+                  "prompt": "Repeat the request word for word."
+                }
+              },
+              {
+                "id": "r",
+                "type": "ducky-auto.route",
+                "x": 300,
+                "y": 160,
+                "config": {}
+              },
+              {
+                "id": "f",
+                "type": "pipeline.finish",
+                "x": 600,
+                "y": 0,
+                "config": {}
+              }
+            ],
+            "edges": [
+              {
+                "source": "s",
+                "target": "a",
+                "kind": "main"
+              },
+              {
+                "source": "a",
+                "target": "f",
+                "kind": "main"
+              },
+              {
+                "source": "a",
+                "target": "r",
+                "kind": "data",
+                "source_pin": "text",
+                "target_pin": "prompt"
+              }
+            ]
+          }
+        }
+      ]
+    }
+  },
+  "backend": {
+    "entry": "backend",
+    "register": "register"
+  }
+}
