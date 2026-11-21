@@ -32,11 +32,55 @@ DEFAULT_RULES: dict = {
     },
     # Auto's price tier per task. Execution "stay" = keep the turn's model (its cache stays warm).
     "auto_tier": {"planning": "best", "coding": "balanced", "modeling": "balanced", "research": "balanced",
-                  "writing": "balanced", "quick": "fast", "general": "balanced", "execution": "stay"},
+                  "writing": "balanced", "quick": "fast", "general": "balanced", "execution": "stay",
+                  "long": "balanced"},
+    # When no keyword matches, the closest example message picks the rule (word overlap, no model).
+    "examples": {
+        "modeling": ["make a low poly rock", "the car looks too shiny", "add a tree with leaves",
+                     "smooth the edges on the sword", "the character looks stretched"],
+        "coding": ["make the door open when a player steps on the plate", "why does it crash when the round starts",
+                   "the build fails with a weird message", "give players points when they eliminate someone",
+                   "the timer never stops"],
+        "planning": ["what steps do i need to build a tycoon", "help me figure out the game loop",
+                     "how do i structure the rounds and scoring", "what should i build first"],
+        "research": ["what is the best way to do a day night cycle", "is there a device that tracks score",
+                     "what do other creators use for leaderboards", "which one is faster"],
+        "writing": ["give the shopkeeper some lines", "name ideas for my island", "make the intro text sound exciting",
+                    "write the quest text"],
+        "quick": ["ok", "yes", "cool thanks", "got it", "nice"],
+    },
+    "match_confidence": 35,      # % word overlap an example needs to pick its rule
     "short_question_chars": 90,  # a question shorter than this is Quick
     "small_context": 8000,       # without prices, only switch while the chat is under this many tokens
     "steps_ahead": 3,            # steps a switch is expected to pay back over
+    "long_context": 100_000,     # a chat over this many tokens goes to the Long chats rule (0 = off)
+    "learn": True,               # Auto prefers models that answered well for this rule before
 }
+
+# How each provider bills its prompt cache: write = price of filling it (x input), ttl_s = how long
+# it stays warm without use, min_prefix = shortest prompt it caches. From each vendor's pricing page:
+# Anthropic 1.25x write and 5 min; OpenAI 30 min, no write fee; Gemini implicit cache from 4k tokens.
+CACHE_RULES = {
+    "anthropic": {"write": 1.25, "ttl_s": 300, "min_prefix": 1024},
+    "openai": {"write": 1.0, "ttl_s": 1800, "min_prefix": 1024},
+    "gemini": {"write": 1.0, "ttl_s": 300, "min_prefix": 4096},
+    "deepseek": {"write": 1.0, "ttl_s": 3600, "min_prefix": 64},
+    "kimi": {"write": 1.0, "ttl_s": 300, "min_prefix": 1024},
+}
+_CACHE_DEFAULT = {"write": 1.0, "ttl_s": 300, "min_prefix": 1024}
+
+
+def cache_rules(gateway: str, price_in: float | None = None, price_write: float | None = None) -> dict:
+    """The gateway's cache billing; a model's own cache-write price wins when the gateway lists it."""
+    out = dict(CACHE_RULES.get((gateway or "").lower(), _CACHE_DEFAULT))
+    if price_write and price_in:
+        out["write"] = round(price_write / price_in, 3)
+    return out
+
+
+def fits_window(context_tokens: int, limit: int | None) -> bool:
+    """Room for the chat plus an answer (15 %); unknown windows always fit."""
+    return not limit or limit >= context_tokens * 1.15
 
 FAST = re.compile(r"\b(haiku|mini|nano|flash|lite|small|instant|tiny|[1-9]b)\b", re.I)  # \b: "gemini" isn't "mini"
 BEST = re.compile(r"\b(opus|ultra|pro|large|max|fable)\b", re.I)
@@ -88,9 +132,16 @@ def merged_rules(saved: dict | None) -> dict:
         except (TypeError, ValueError):
             return DEFAULT_RULES[key]
 
-    return {"order": order, "keywords": keywords, "auto_tier": tiers, "custom": custom,
+    examples = {**DEFAULT_RULES["examples"], **{c: [] for c in custom}}
+    for task, lines in (s.get("examples") or {}).items():
+        if task in ruled and isinstance(lines, list):
+            examples[task] = [str(x).strip()[:200] for x in lines if str(x).strip()][:30]
+
+    return {"order": order, "keywords": keywords, "examples": examples, "auto_tier": tiers, "custom": custom,
             "short_question_chars": num("short_question_chars", 0, 1000),
-            "small_context": num("small_context", 0, 2_000_000), "steps_ahead": num("steps_ahead", 1, 50)}
+            "small_context": num("small_context", 0, 2_000_000), "steps_ahead": num("steps_ahead", 1, 50),
+            "long_context": num("long_context", 0, 10_000_000), "match_confidence": num("match_confidence", 1, 100),
+            "learn": bool(s.get("learn", DEFAULT_RULES["learn"]))}
 
 
 def _keyword_rx(word: str) -> re.Pattern[str]:
@@ -100,19 +151,62 @@ def _keyword_rx(word: str) -> re.Pattern[str]:
     return re.compile(lead + body + (r"\w*" if stem else (r"\b" if re.search(r"\w$", word) else "")), re.I)
 
 
-def explain_task(text: str, last_role: str = "user", rules: dict | None = None) -> tuple[str, str]:
-    """(task, why). A step right after a tool result is execution."""
+_STOP = frozenset("a an the and or but to of in on at for with my me i it is are be do does did this that "
+                  "these those you your we our can could would should will just so some any please "
+                  "what how why which when where who there here make get want need".split())
+
+
+def _stems(text: str) -> set[str]:
+    """Words without their ending (steps → step, crashed → crash), common words dropped."""
+    out = set()
+    for w in re.findall(r"[a-z0-9@]+", (text or "").lower()):
+        if w in _STOP:
+            continue
+        for end in ("ing", "ed", "es", "s", "ly"):
+            if len(w) > len(end) + 2 and w.endswith(end):
+                w = w[: -len(end)]
+                break
+        out.add(w)
+    return out
+
+
+def similar_task(text: str, rules: dict) -> tuple[str, float, str]:
+    """(task, score 0..1, example) of the example message closest to ``text``; ("", 0, "") when none."""
+    words = _stems(text)
+    best = ("", 0.0, "")
+    if not words:
+        return best
+    for task in rules["order"]:
+        for ex in (rules.get("examples") or {}).get(task) or []:
+            other = _stems(ex)
+            if other:
+                score = len(words & other) / (len(words) * len(other)) ** 0.5
+                if score > best[1]:
+                    best = (task, score, ex)
+    return best
+
+
+def explain_task(text: str, last_role: str = "user", rules: dict | None = None,
+                 context_tokens: int = 0) -> tuple[str, str]:
+    """(task, why). A step right after a tool result is execution; a chat over Long chats' size is long;
+    then keywords top to bottom; then the closest example message; then a short question is quick."""
     r = rules or DEFAULT_RULES
     if (last_role or "").lower() == "tool":
         return "execution", "a step right after a tool returned"
+    limit = r.get("long_context") or 0
+    if limit and context_tokens > limit:
+        return "long", f"the chat is {context_tokens // 1000}k tokens (over {limit // 1000}k)"
     t = (text or "").strip()
     for task in r["order"]:
         for word in r["keywords"].get(task) or []:
             if _keyword_rx(word).search(t):
                 return task, f'matched "{word}"'
+    task, score, ex = similar_task(t, r)
+    if task and score * 100 >= r.get("match_confidence", DEFAULT_RULES["match_confidence"]):
+        return task, f'like "{ex}" ({round(score * 100)}%)'
     if t.endswith("?") and len(t) < r["short_question_chars"]:
         return "quick", f"a question under {r['short_question_chars']} characters"
-    return "general", "no keyword matched"
+    return "general", "no keyword or example matched"
 
 
 def classify(text: str, last_role: str = "user", rules: dict | None = None) -> str:
@@ -164,24 +258,35 @@ def worth_switching(
     steps: int = 3,
     out_tokens: int = 800,
     small_context: int = SMALL_CONTEXT,
+    stay_warm: float = 1.0,
+    new_warm: float = 0.0,
+    stay_write: float = 1.0,
+    new_write: float = 1.25,
+    hit: float = 1.0,
 ) -> bool:
     """Is moving the chat to another model cheaper than staying, counting the re-read?
 
     ``current`` / ``new``: (price_in, price_out, price_cached_in) per 1M tokens, None unknown.
-    The new model reads the whole chat once uncached (+25 % cache write), then cached; the current
-    model reads it cached every step. An upgrade (stronger tier) always switches: quality first.
+    ``stay_warm`` / ``new_warm``: share of the chat each model would read from its cache on the next
+    step (0 once its cache expired, e.g. the chat sat idle). The rest is read at the input price times
+    that gateway's cache-write price (``stay_write`` / ``new_write``). Later steps read ``hit`` of the
+    chat from cache (the model's measured share). An upgrade (stronger tier) always switches.
     """
     if upgrade or current is None:
         return True
     if new is None or None in current[:2] or None in new[:2]:
-        return context_tokens < small_context
+        return context_tokens < small_context or stay_warm == 0
     a_in, a_out, a_cached = current
     b_in, b_out, b_cached = new
     a_cached = a_in * 0.1 if a_cached is None else a_cached
     b_cached = b_in * 0.1 if b_cached is None else b_cached
-    stay = steps * (context_tokens * a_cached + out_tokens * a_out)
-    switch = context_tokens * b_in * 1.25 + (steps - 1) * context_tokens * b_cached + steps * out_tokens * b_out
-    return switch < stay
+
+    def run(p_in: float, p_cached: float, p_out: float, warm: float, write: float) -> float:
+        first = context_tokens * (warm * p_cached + (1 - warm) * p_in * write)
+        later = (steps - 1) * context_tokens * (hit * p_cached + (1 - hit) * p_in)
+        return first + later + steps * out_tokens * p_out
+
+    return run(b_in, b_cached, b_out, new_warm, new_write) < run(a_in, a_cached, a_out, stay_warm, stay_write)
 
 
 def parse_route(value: str) -> tuple[str, str]:

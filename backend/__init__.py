@@ -17,17 +17,18 @@ import threading
 import time
 import uuid
 
-from .analytics import StepLog, cost_usd, summary
+from .analytics import StepLog, cost_usd, summary, tokens_of
+from .learn import rank as learned_order
 from .share import ENDPOINT_PATH, MAX_BATCH, event_for
 from .tuner import suggest
 from .router import (
-    TASKS, TIER_RANK, all_tasks, custom_id, explain_task, merged_rules, parse_route, pick_tier, rank_tier, tier_count, tier_of,
-    worth_switching,
+    TASKS, TIER_RANK, all_tasks, cache_rules, custom_id, explain_task, fits_window, merged_rules, parse_route, pick_tier,
+    rank_tier, tier_count, tier_of, worth_switching,
 )
 
 SELF = "ducky_auto"
 MODEL_ID = "ducky-auto"
-VERSION = "1.13.1"
+VERSION = "1.14.0"
 _SHARE_EVERY = 10  # steps per upload
 _SHARE_MAX_WAIT_S = 300.0  # or this long after the first one waiting
 _SHARE_QUEUE_MAX = 200  # offline: keep at most this many, oldest dropped
@@ -140,13 +141,55 @@ def register(api) -> None:
         model_cache[gateway] = (time.time(), ids)
         return ids
 
-    def prices(gateway: str, model: str) -> tuple | None:
+    def model_info(gateway: str, model: str):
         from backend.agent.model_fetch import get_model_info
 
-        info = get_model_info(gateway, model)
+        try:
+            return get_model_info(gateway, model)
+        except Exception:
+            return None
+
+    def prices(gateway: str, model: str) -> tuple | None:
+        info = model_info(gateway, model)
         if info is None:
             return None
         return (info.price_in, info.price_out, info.price_cached_in)
+
+    def cache_of(gateway: str, model: str) -> dict:
+        info = model_info(gateway, model)
+        return cache_rules(gateway, getattr(info, "price_in", None), getattr(info, "price_cache_write", None))
+
+    def window_of(gateway: str, model: str) -> int | None:
+        return getattr(model_info(gateway, model), "context_limit", None)
+
+    recent: dict = {"t": 0.0, "rows": []}
+
+    def recent_rows() -> list[dict]:
+        """The last 500 logged steps, read at most once a minute (learning and cache hit rates)."""
+        if time.time() - recent["t"] > 60:
+            recent.update(t=time.time(), rows=log.rows(limit=500))
+        return recent["rows"]
+
+    def hit_rate(gateway: str, model: str) -> float:
+        """Share of input this model really read from cache lately; 0.9 until it has 3 steps."""
+        tin = tcached = n = 0
+        for r in recent_rows():
+            if r.get("gateway") == gateway and r.get("model") == model:
+                i, _o, c = tokens_of(r.get("usage") or {})
+                tin, tcached, n = tin + i, tcached + c, n + 1
+        return round(tcached / tin, 3) if n >= 3 and tin else 0.9
+
+    # (chat, gateway, model) → when that model last ran a step of the chat: its cache is warm until
+    # the gateway's cache timer runs out.
+    last_used: dict[tuple[str, str, str], float] = {}
+
+    def warmth(chat: str, gateway: str, model: str, ctx: int) -> tuple[float, float]:
+        """(share of the chat the model reads from cache now, seconds since it last ran here)."""
+        idle = time.time() - last_used.get((chat, gateway, model), 0.0)
+        rule = cache_of(gateway, model)
+        if idle > rule["ttl_s"] or ctx < rule["min_prefix"]:
+            return 0.0, idle
+        return hit_rate(gateway, model), idle
 
     def build(gateway: str, model: str, effort: str = "off"):
         from backend.uefn_plugins.plugin_host.gateways import get_llm_provider_registration
@@ -197,25 +240,32 @@ def register(api) -> None:
         g, m = parse_route(str(s.get(f"route_{task}") or ""))
         return (g, m) if g and g != SELF and m else ("", "")
 
-    def candidates(task: str, s: dict, r: dict) -> list[tuple[str, str]]:
-        """The person's model for this task first (when set), then Auto's ranked picks."""
+    def candidates(task: str, s: dict, r: dict, ctx: int = 0) -> list[tuple[str, str]]:
+        """The person's model for this task first (when set), then Auto's ranked picks, ordered by how
+        they did before when Learn from results is on. Models whose window can't hold the chat are left out."""
         out: list[tuple[str, str]] = []
         gateway, model = picked(s, task)
         if gateway and gateway in gateways():
             models_of(gateway)  # loads its prices
             out.append((gateway, model))
+        mine = len(out)
         tier = r["auto_tier"].get(task, "balanced")
         tier = "balanced" if tier == "stay" else tier
         wanted = str(s.get("gateway") or "").strip().lower()
         ranked = sorted(gateways(), key=lambda g: -tier_count(models_of(g)))
         for g in ([wanted] if wanted in ranked else []) + [g for g in ranked if g != wanted]:
             out += [(g, m) for m in rank_tier(models_of(g), tier, _PER_GATEWAY) if (g, m) not in out]
+        if ctx:
+            out = [c for c in out if fits_window(ctx, window_of(*c))]
+            mine = min(mine, len(out)) if out[:1] == [(gateway, model)] else 0
+        if r.get("learn"):
+            out = learned_order(out, recent_rows(), task, keep_first=mine)
         return out
 
-    async def first_healthy(task: str, s: dict, r: dict) -> tuple[str, str, str, list[dict]]:
+    async def first_healthy(task: str, s: dict, r: dict, ctx: int = 0) -> tuple[str, str, str, list[dict]]:
         """(gateway, model, note, failed); gateway "" when nothing answered."""
         failed: list[dict] = []
-        for g, m in await asyncio.to_thread(candidates, task, s, r):
+        for g, m in await asyncio.to_thread(candidates, task, s, r, ctx):
             ok, detail = await probe(g, m)
             if ok:
                 return g, m, f"skipped {len(failed)} that didn't answer" if failed else "", failed
@@ -250,10 +300,10 @@ def register(api) -> None:
             s = await asyncio.to_thread(config)
             r = await asyncio.to_thread(rules)
             last_role = getattr(messages[-1], "role", "user") if messages else "user"
-            base_task, base_why = explain_task(last_user_text(messages), "user", r)
-            task = "execution" if last_role == "tool" else base_task
             key = chat_key(system, messages)
             ctx = context_tokens(system, messages)
+            base_task, base_why = explain_task(last_user_text(messages), "user", r, context_tokens=ctx)
+            task = "execution" if last_role == "tool" else base_task
             with lock:
                 current = chat_model.get(key)
             row: dict = {"chat": key, "task": task, "base_task": base_task, "matched": base_why,
@@ -286,7 +336,7 @@ def register(api) -> None:
                 pg, pm = picked(s, route_task)
                 if pg and (blocked := pick_problem(pg)):
                     row["pick_skipped"] = f"{pg}:{pm}: {blocked}"
-                gateway, model, note, row["failed"] = await first_healthy(route_task, s, r)
+                gateway, model, note, row["failed"] = await first_healthy(route_task, s, r, ctx)
                 if not gateway and current:
                     gateway, model, decision = current[0], current[1], "kept (nothing else answered)"
                 if not gateway:
@@ -296,12 +346,22 @@ def register(api) -> None:
                     return
                 if current and current != (gateway, model) and decision == "same":
                     upgrade = TIER_RANK[tier_of(model)] > TIER_RANK[tier_of(current[1])]
+                    target = (gateway, model)
+                    stay_warm, idle = warmth(key, *current, ctx)
+                    new_warm, _ = warmth(key, *target, ctx)
+                    row.update(stay_warm=stay_warm, new_warm=new_warm)
                     if await asyncio.to_thread(
-                        lambda: worth_switching(ctx, prices(*current), prices(gateway, model), upgrade=upgrade,
-                                                steps=r["steps_ahead"], small_context=r["small_context"])
+                        lambda: worth_switching(
+                            ctx, prices(*current), prices(*target), upgrade=upgrade, steps=r["steps_ahead"],
+                            small_context=r["small_context"], stay_warm=stay_warm, new_warm=new_warm,
+                            stay_write=cache_of(*current)["write"], new_write=cache_of(*target)["write"],
+                            hit=hit_rate(*target))
                     ):
                         decision = "switched"
-                        row["why"] = "upgrade for quality" if upgrade else "cheaper even after re-reading the chat"
+                        row["why"] = ("upgrade for quality" if upgrade
+                                      else f"{current[1]}'s cache had gone cold ({int(idle // 60)} min idle)" if not stay_warm
+                                      else f"{model}'s cache was still warm" if new_warm
+                                      else "cheaper even after re-reading the chat")
                     else:
                         decision = "kept"
                         row["wanted"] = f"{gateway}:{model}"
@@ -316,6 +376,7 @@ def register(api) -> None:
                 row["thinking_dropped"] = True
             with lock:
                 chat_model[key] = (gateway, model)
+                last_used[(key, gateway, model)] = time.time()
             row.update({"gateway": gateway, "model": model, "decision": decision, "note": note})
             yield routed_status(f"🦆 Ducky Auto → {model} ({task})" + (f" · {note}" if note else ""),
                                 f"{gateway}:{model}")
@@ -596,7 +657,12 @@ def register(api) -> None:
         for t, tier in new["auto_tier"].items():
             if old["auto_tier"].get(t, tier) != tier:
                 out.append((f"{t} auto", old["auto_tier"][t], tier))
-        for k in ("short_question_chars", "small_context", "steps_ahead"):
+        for t in sorted(set(old["examples"]) & set(new["examples"])):
+            a, b = old["examples"][t], new["examples"][t]
+            if a != b:
+                added, gone = [w for w in b if w not in a], [w for w in a if w not in b]
+                out.append((f"{t} examples", " | ".join(gone) or "–", " | ".join(added) or "–"))
+        for k in ("short_question_chars", "small_context", "steps_ahead", "long_context", "match_confidence", "learn"):
             if old[k] != new[k]:
                 out.append((k, str(old[k]), str(new[k])))
         return out
@@ -614,7 +680,13 @@ def register(api) -> None:
     def save_rules(rules_patch: dict | None = None, by: str = "you", why: str = "") -> dict:
         if not isinstance(rules_patch, dict):
             return {"ok": False, "error": "Send the rules as an object (order, keywords, auto_tier, numbers)."}
-        return store_rules(merged_rules({**(api.data.get("rules") or {}), **rules_patch}), by, why)
+        saved = dict(api.data.get("rules") or {})
+        for k, v in rules_patch.items():
+            # keywords / examples / auto_tier patch one task at a time: the other tasks keep theirs.
+            # "custom" is the whole set of the person's rules, so it replaces.
+            deep = k != "custom" and isinstance(v, dict) and isinstance(saved.get(k), dict)
+            saved[k] = {**saved[k], **v} if deep else v
+        return store_rules(merged_rules(saved), by, why)
 
     def add_rule(label: str = "", keywords: list | None = None, by: str = "you", why: str = "") -> dict:
         """A new rule of the person's own (e.g. "Sound & music"), checked first."""
@@ -976,7 +1048,7 @@ def register(api) -> None:
     @api.tool(intent=r"\bducky[ -]?auto\b", listener=False)
     def ducky_auto_set_model(task: str = "", model: str = "", why: str = "", effort: str | None = None) -> dict:
         """Set the model for one Ducky Auto task (planning, coding, modeling, execution, research, writing,
-        quick, general). model = "gateway:model" (e.g. anthropic:claude-sonnet-5-5) or "" for Auto.
+        quick, general, long = chats over the Long chats size). model = "gateway:model" (e.g. anthropic:claude-sonnet-5-5) or "" for Auto.
         effort = thinking effort for that task (off, low, medium, high…; "" = the chat's slider; omit = keep).
         why = a short reason, shown in the change log."""
         return set_model(task, model, by="agent", why=why, effort=effort)

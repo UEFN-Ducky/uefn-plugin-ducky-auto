@@ -9,7 +9,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 from router import (  # noqa: E402
     DEFAULT_RULES, classify, explain_task, merged_rules, parse_route, pick_tier, rank_tier, tier_count, tier_of,
-    worth_switching,
+    cache_rules, fits_window, similar_task, worth_switching,
 )
 
 OPUS = (5.0, 25.0, 0.5)
@@ -69,6 +69,47 @@ def test_switch_costs() -> None:
     assert worth_switching(50_000, (None, None, None), HAIKU, small_context=100_000)
 
 
+def test_cache_aware_switching() -> None:
+    assert cache_rules("anthropic")["write"] == 1.25 and cache_rules("openai")["ttl_s"] == 1800
+    assert cache_rules("somebody") == {"write": 1.0, "ttl_s": 300, "min_prefix": 1024}
+    assert cache_rules("anthropic", 3.0, 6.0)["write"] == 2.0  # the model's own write price wins
+    # 200k chat, Opus → Haiku for 1 step: a warm Opus cache makes staying cheaper...
+    assert not worth_switching(200_000, OPUS, HAIKU, steps=1, out_tokens=100)
+    # ...but after the cache expired (chat idle), staying re-reads it all on Opus: switch.
+    assert worth_switching(200_000, OPUS, HAIKU, steps=1, out_tokens=100, stay_warm=0.0, stay_write=1.25)
+    # Going back to a model whose cache is still warm costs almost nothing.
+    assert worth_switching(200_000, OPUS, HAIKU, steps=1, out_tokens=100, new_warm=1.0)
+    # No write fee (OpenAI-style) tips a borderline switch: 5 steps at 60k, 90 % cache hits, 2x price gap.
+    cheap, dear = (1.0, 4.0, 0.1), (2.0, 8.0, 0.2)
+    assert not worth_switching(60_000, dear, cheap, steps=5, new_write=1.25, hit=0.9)
+    assert worth_switching(60_000, dear, cheap, steps=5, new_write=1.0, hit=0.9)
+    # No prices: a cold cache allows the switch whatever the size.
+    assert worth_switching(500_000, (None, None, None), HAIKU, stay_warm=0.0)
+
+
+def test_long_chats_and_windows() -> None:
+    r = merged_rules(None)
+    assert explain_task("fix the verse bug", "user", r, context_tokens=140_000) == (
+        "long", "the chat is 140k tokens (over 100k)")
+    assert explain_task("fix the verse bug", "user", r, context_tokens=20_000)[0] == "coding"
+    assert explain_task("go on", "tool", r, context_tokens=500_000)[0] == "execution"  # tool steps stay
+    assert explain_task("fix it", "user", merged_rules({"long_context": 0}), context_tokens=900_000)[0] != "long"
+    assert not fits_window(130_000, 128_000) and fits_window(100_000, 128_000) and fits_window(10**6, None)
+
+
+def test_examples() -> None:
+    r = merged_rules(None)
+    task, why = explain_task("the door doesn't open when I step on the plate", "user", r)
+    assert task == "coding" and why.startswith('like "make the door open'), why
+    assert explain_task("cool thanks!", "user", r)[0] == "quick"
+    assert explain_task("make the cinema bigger and add more seats everywhere", "user", r)[0] == "general"
+    mine = merged_rules({"custom": {"my_sound": {"label": "Sound"}}, "order": ["my_sound"],
+                         "examples": {"my_sound": ["the explosion is too quiet"], "coding": []}})
+    assert similar_task("explosions are too quiet", mine)[0] == "my_sound"
+    assert mine["examples"]["coding"] == []  # the person can clear a rule's examples
+    assert merged_rules({"match_confidence": 99})["match_confidence"] == 99
+
+
 def test_parse_route() -> None:
     assert parse_route("anthropic:claude-opus-5-5") == ("anthropic", "claude-opus-5-5")
     assert parse_route("ollama:llama3:8b") == ("ollama", "llama3:8b")
@@ -96,5 +137,8 @@ if __name__ == "__main__":
     test_person_rules()
     test_tiers()
     test_switch_costs()
+    test_cache_aware_switching()
+    test_long_chats_and_windows()
+    test_examples()
     test_parse_route()
     print("router ok")

@@ -13,6 +13,7 @@ const rules = {
   ok: true, version: "1.13.0", gateway: "anthropic", effort: { coding: "high" }, pick_problems: {},
   picked: { planning: "anthropic:claude-opus-5-5" }, logins: { planning: "claude_code:claude-opus-5-5" },
   rules: { order: ["coding", "planning"], keywords: { coding: ["code"], planning: ["plan*"] }, custom: {},
+           examples: { coding: ["make the door open"] }, long_context: 100000, match_confidence: 35, learn: true,
            short_question_chars: 90, small_context: 8000, steps_ahead: 3 },
 };
 const answers = {
@@ -45,8 +46,9 @@ const $ = (s) => mount.querySelector(s);
   await tick();
   same([...mount.querySelectorAll(".dka-tab")].map((b) => b.dataset.tab), ["rules", "analytics", "changes", "sharing"]);
   assert.ok(mount.textContent.includes("plugin 1.13.0"), "version in the header");
-  assert.strictEqual(mount.querySelectorAll(".dka-task").length, 4, "coding, planning, tool steps, everything else");
-  assert.strictEqual(pickers.length, 4);
+  assert.strictEqual(mount.querySelectorAll(".dka-task").length, 5, "coding, planning, long chats, tool steps, everything else");
+  assert.ok($('[data-task="long"]').textContent.includes("over 100k tokens"), "long chats rule");
+  assert.strictEqual(pickers.length, 5);
   assert.strictEqual(pickers.find((p) => p.model === "claude_code:claude-opus-5-5").logins, true);
   pickers[0].onEffortChange("low");
   same(calls.at(-1), ["set_model", { task: "coding", model: "", effort: "low" }]);
@@ -59,6 +61,19 @@ const $ = (s) => mount.querySelector(s);
   $('[data-task="coding"] [data-rm="0"]').click();
   same(calls.at(-1), ["save_rules", { rules_patch: { keywords: { coding: ["bug", "fix*"] } } }]);
 
+  // Example chips: a whole line, commas kept.
+  const exIn = $('[data-task="coding"] [data-chips="examples"] [data-chip-in]');
+  exIn.value = "Fix the timer, it skips";
+  exIn.dispatchEvent(new window.KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+  same(calls.at(-1), ["save_rules", { rules_patch: { examples: { coding: ["make the door open", "fix the timer, it skips"] } } }]);
+
+  // Learn from results switch.
+  $("[data-numbers]").click();
+  assert.strictEqual($("[data-learn]").getAttribute("aria-checked"), "true");
+  $("[data-learn]").click();
+  same(calls.at(-1), ["save_rules", { rules_patch: { learn: false } }]);
+  assert.strictEqual($("[data-learn]").getAttribute("aria-checked"), "false");
+
   // Try a message lights the path.
   const tryIn = $("[data-try]");
   tryIn.value = "plan a boss fight";
@@ -69,6 +84,13 @@ const $ = (s) => mount.querySelector(s);
   assert.ok($('[data-task="coding"]').closest(".dka-tl-row").classList.contains("is-skipped"), "coding skipped");
   assert.ok($(".dka-chip.is-hit").textContent.startsWith("plan*"), "keyword lit");
   assert.ok($(".dka-chain-card.is-used").textContent.includes("Your login"), "login used");
+
+  // An example match tags the rule and lights the example.
+  answers.route = { ok: true, task: "coding", why: 'like "make the door open" (62%)', source: "auto", gateway: "gemini", model: "f", note: "", failed: [] };
+  $("[data-try-go]").click();
+  await tick();
+  assert.ok($('[data-task="coding"]').textContent.includes("Like “make the door open” 62%"), "example tag");
+  assert.strictEqual($('[data-chips="examples"] .dka-chip.is-hit').textContent.replace("×", ""), "make the door open", "example lit");
 
   // Health tools.
   $('[data-job="check"]').click();

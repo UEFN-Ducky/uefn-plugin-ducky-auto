@@ -10,9 +10,13 @@
 
   const TASK_NAMES = {
     planning: "Planning", coding: "Coding", modeling: "Modeling", research: "Research",
-    writing: "Writing", quick: "Quick questions", execution: "Tool steps", general: "Everything else",
+    writing: "Writing", quick: "Quick questions", execution: "Tool steps", general: "Everything else", long: "Long chats",
   };
-  const WHEN = { execution: "When the step only runs tools", general: "When no rule above matched" };
+  const WHEN = {
+    execution: () => "When the step only runs tools",
+    long: (r) => r.long_context ? `When the chat is over ${fmtK(r.long_context)} tokens (checked before the keywords)` : "Off: set Long chat size under Numbers",
+    general: () => "When no keyword or example matched",
+  };
   const GATEWAYS = [
     ["", "Any with a key"], ["anthropic", "Anthropic"], ["openai", "OpenAI"], ["gemini", "Gemini"],
     ["spacexai", "SpaceX AI"], ["kimi", "Kimi"], ["ollama", "Ollama"],
@@ -41,6 +45,8 @@
     ["short_question_chars", "Short question (characters)", "A message ending in “?” that is shorter than this counts as Quick."],
     ["small_context", "Small context (tokens)", "When prices aren't known, a chat only switches model while it is under this size."],
     ["steps_ahead", "Steps ahead", "How many steps a model switch must pay itself back over."],
+    ["long_context", "Long chat size (tokens)", "A chat bigger than this goes to the Long chats rule. 0 turns it off."],
+    ["match_confidence", "Example match (%)", "How close a message must be to one of a rule's examples to use that rule, when no keyword matched."],
   ];
   const RAISED = "color-mix(in srgb,var(--fg) 5%,var(--card))";
   const HOVER = "color-mix(in srgb,var(--fg) 7%,transparent)";
@@ -164,6 +170,13 @@
 .dka-chip button{width:22px;height:22px;border:none;border-radius:4px;background:transparent;color:var(--muted);cursor:pointer;font-size:13px}
 .dka-chip button:hover{color:var(--red)}
 .dka-chip-in{flex:1;min-width:110px;height:28px;border:none;background:transparent;color:var(--fg);font-size:13px;font-family:${MONO};outline:none}
+.dka-examples{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.dka-ex-label{flex:none;width:64px;font-size:11px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--muted)}
+.dka-chips.is-examples .dka-chip,.dka-chips.is-examples .dka-chip-in{font-family:inherit}
+.dka-learn{display:flex;gap:10px;align-items:center;padding-top:12px;border-top:1px solid var(--border)}
+.dka-learn>div{flex:1;display:flex;flex-direction:column;gap:4px}
+.dka-learn b{font-size:13px;font-weight:600}
+.dka-learn span{font-size:12px;color:var(--muted);line-height:1.45}
 .dka-when{flex:1 1 280px;min-width:0;min-height:40px;display:flex;align-items:center;padding:0 12px;border-radius:8px;background:${RAISED};font-size:13px;color:var(--muted)}
 .dka-arrow{flex:none;font-size:18px;color:var(--border);transition:color .25s}
 .is-matched .dka-arrow{color:var(--accent)}
@@ -448,10 +461,11 @@
     const r = data.rules;
     const custom = r.custom || {};
     const order = r.order;
-    const all = [...order, "execution", "general"];
+    const all = [...order, "long", "execution", "general"];
     const tr = state.trace?.task ? state.trace : null;
     const kw = tr ? (/^matched "(.+)"$/.exec(tr.why || "") || [])[1] || "" : "";
-    const short = tr && !kw && tr.task === "quick";
+    const like = tr ? /^like "(.+)" \((\d+)%\)$/.exec(tr.why || "") : null;
+    const short = tr && !kw && !like && tr.task === "quick";
     let mIdx = tr ? all.indexOf(tr.task) : -1;
     if (tr && mIdx < 0) mIdx = all.length - 1;
     const checks = state.checks || {};
@@ -459,12 +473,14 @@
     const rowState = (t, gi) => {
       if (!tr) return "";
       if (gi === mIdx) return "matched";
-      if (t === "execution") return "skipped";
+      if (t === "execution" || t === "long") return "skipped";
       if (gi < mIdx || (short && gi < order.length)) return "skipped";
       return "unreached";
     };
-    const rowTag = (t, st) => st === "matched" ? (kw ? `Matched “${kw}”` : short ? "Short question" : "Matched")
-      : st === "skipped" ? (t === "execution" ? "Not a tool step" : "No match") : st === "unreached" ? "Not reached" : "";
+    const rowTag = (t, st) => st === "matched"
+      ? (kw ? `Matched “${kw}”` : like ? `Like “${like[1]}” ${like[2]}%` : short ? "Short question" : "Matched")
+      : st === "skipped" ? (t === "execution" ? "Not a tool step" : t === "long" ? "Chat not long" : "No match")
+        : st === "unreached" ? "Not reached" : "";
 
     const rows = all.map((t, gi) => {
       const fixed = gi >= order.length;
@@ -472,9 +488,9 @@
       const ck = checks[t];
       const problem = (data.pick_problems || {})[t];
       const words = r.keywords[t] || [];
+      const examples = (r.examples || {})[t] || [];
       const lineIn = tr && gi <= mIdx ? " is-lit" : "";
       const lineOut = tr && gi < mIdx ? " is-lit" : "";
-      const chips = words.map((w, k) => `<span class="dka-chip${st === "matched" && w === kw ? " is-hit" : ""}">${esc(w)}<button type="button" data-rm="${k}" aria-label="Remove keyword ${esc(w)}">×</button></span>`).join("");
       const sep = gi === order.length ? `<div class="dka-sep"><div><div class="dka-line${lineIn}"></div></div><div><span class="dka-kicker">Always checked last</span><span></span></div></div>` : "";
       return `${sep}<div class="dka-tl-row ${st ? `is-${st}` : ""}">
         <div class="dka-rail"><div class="dka-line${lineIn}"></div><div class="dka-node">${fixed ? "·" : gi + 1}</div><div class="dka-line${lineOut}"></div></div>
@@ -492,11 +508,12 @@
             ${t in custom ? `<button type="button" class="dka-icon dka-del" data-del aria-label="Delete rule">×</button>` : ""}
           </div>
           <div class="dka-task-body">
-            ${fixed ? `<div class="dka-when">${esc(WHEN[t])}</div>`
-              : `<div class="dka-chips" data-chips>${chips}<input class="dka-chip-in" data-chip-in aria-label="Add keywords to ${esc(taskName(t))}" placeholder="${words.length ? "Add…" : "Add keywords, e.g. sound*"}" /></div>`}
+            ${fixed ? `<div class="dka-when">${esc(WHEN[t](r))}</div>`
+              : chipsHtml("keywords", t, words, st === "matched" ? kw : "")}
             <span class="dka-arrow" aria-hidden="true">→</span>
             <div class="dka-picker" data-picker></div>
           </div>
+          ${fixed ? "" : `<div class="dka-examples"><span class="dka-ex-label">Examples</span>${chipsHtml("examples", t, examples, st === "matched" && like ? like[1] : "")}</div>`}
           ${problem && !ck ? `<div class="dka-warn">⚠ ${esc(problem)}: Auto is used until it can run.</div>` : ""}
           ${ck && !ck.ok ? `<div class="dka-fail">✕ ${esc(ck.note || "No model answered its check")}. Auto is used until it can run.</div>` : ""}
         </div></div></div>`;
@@ -572,7 +589,7 @@
       <div class="dka-split">
         <section class="dka-card dka-flow">
           <div class="dka-step-head">
-            <div><div class="dka-kicker">Step 1</div><div class="dka-step-title">Find the rule</div><div class="dka-step-sub">Checked top to bottom. The first rule whose keywords match wins.</div></div>
+            <div><div class="dka-kicker">Step 1</div><div class="dka-step-title">Find the rule</div><div class="dka-step-sub">Checked top to bottom. The first rule whose keywords match wins; if none do, the rule with the closest example.</div></div>
             <button type="button" class="dka-btn is-raised" data-add-toggle>+ New rule</button>
           </div>
           ${state.adding ? `<div class="dka-add">
@@ -610,6 +627,8 @@
               <span>${state.numbersOpen ? "▾" : "▸"}</span><span class="dka-grow"><b>Numbers</b><small>Fine-tuning. Most people never need these.</small></span></button>
             ${state.numbersOpen ? `<div class="dka-numbers">
               ${NUMBERS.map(([k, label, help]) => `<label class="dka-number"><div><span>${esc(label)}</span><input class="dka-input" type="number" min="0" data-n="${k}" value="${esc(r[k])}" /></div><span>${esc(help)}</span></label>`).join("")}
+              <div class="dka-learn"><div><b>Learn from results</b><span>Auto tries the models that worked best for each rule first. Only Auto's own choices move; your picks never change.</span></div>
+                <button type="button" class="dka-switch" role="switch" data-learn aria-label="Learn from results" aria-checked="${r.learn !== false}"><span></span></button></div>
               <div class="dka-reset"><span>Puts every rule, keyword and number back the way it shipped. Your own rules are removed.</span>
                 <button type="button" class="dka-btn" data-reset>Reset rules to defaults</button></div>
             </div>` : ""}
@@ -667,8 +686,7 @@
         await call("delete_rule", { task: t });
         await reloadRules();
       });
-      const chips = card.querySelector("[data-chips]");
-      if (chips) bindChips(chips, t);
+      card.querySelectorAll("[data-chips]").forEach((box) => bindChips(box, t));
       const slot = card.querySelector("[data-picker]");
       let current = (data.logins || {})[t] || (data.picked || {})[t] || "";
       if (host().mountModelPicker) {
@@ -704,6 +722,11 @@
       r[inp.dataset.n] = v;
       void call("save_rules", { rules_patch: { [inp.dataset.n]: v } });
     }));
+    body.querySelector("[data-learn]")?.addEventListener("click", (e) => {
+      r.learn = r.learn === false;
+      e.currentTarget.setAttribute("aria-checked", String(r.learn));
+      void call("save_rules", { rules_patch: { learn: r.learn } });
+    });
     armed(body.querySelector("[data-reset]"), "Click again to reset", async () => {
       await call("reset_rules");
       state.checks = null;
@@ -712,23 +735,35 @@
     });
   }
 
-  // Keyword chips: comma, Enter or leaving the field adds; Backspace on an empty field removes the last.
+  // Keywords are split on commas; an example is a whole message, so only Enter adds it.
+  const CHIP_FIELDS = {
+    keywords: { what: "keyword", empty: "Add keywords, e.g. sound*", split: true },
+    examples: { what: "example", empty: "Add an example message, e.g. the explosion is too quiet", split: false },
+  };
+  function chipsHtml(field, t, list, hit = "") {
+    const f = CHIP_FIELDS[field];
+    return `<div class="dka-chips${field === "examples" ? " is-examples" : ""}" data-chips="${field}">${list.map((w, k) => `<span class="dka-chip${hit && w === hit ? " is-hit" : ""}">${esc(w)}<button type="button" data-rm="${k}" aria-label="Remove ${f.what} ${esc(w)}">×</button></span>`).join("")}<input class="dka-chip-in" data-chip-in aria-label="Add ${f.what}s to ${esc(taskName(t))}" placeholder="${list.length ? "Add…" : esc(f.empty)}" /></div>`;
+  }
+
+  // Chips: Enter (or a comma for keywords) or leaving the field adds; Backspace on an empty field removes the last.
   function bindChips(box, t) {
+    const field = box.dataset.chips || "keywords";
     const input = box.querySelector("[data-chip-in]");
-    const words = () => state.rules.rules.keywords[t] || [];
+    const words = () => (state.rules.rules[field] || {})[t] || [];
     const save = (next) => {
-      state.rules.rules.keywords[t] = next;
-      void call("save_rules", { rules_patch: { keywords: { [t]: next } } });
+      (state.rules.rules[field] ||= {})[t] = next;
+      void call("save_rules", { rules_patch: { [field]: { [t]: next } } });
       const focus = document.activeElement === input;
       const fresh = document.createElement("div");
-      fresh.innerHTML = `<div class="dka-chips" data-chips>${next.map((w, k) => `<span class="dka-chip">${esc(w)}<button type="button" data-rm="${k}" aria-label="Remove keyword ${esc(w)}">×</button></span>`).join("")}<input class="dka-chip-in" data-chip-in aria-label="${esc(input.getAttribute("aria-label"))}" placeholder="${next.length ? "Add…" : "Add keywords, e.g. sound*"}" /></div>`;
+      fresh.innerHTML = chipsHtml(field, t, next);
       const nb = fresh.firstElementChild;
       box.replaceWith(nb);
       bindChips(nb, t);
       if (focus) nb.querySelector("[data-chip-in]").focus();
     };
     const commit = () => {
-      const add = input.value.split(",").map((w) => w.trim().toLowerCase()).filter(Boolean);
+      const raw = CHIP_FIELDS[field].split ? input.value.split(",") : [input.value];
+      const add = raw.map((w) => w.trim().toLowerCase()).filter(Boolean);
       input.value = "";
       const cur = words();
       const next = [...cur, ...add.filter((w, i) => !cur.includes(w) && add.indexOf(w) === i)];
@@ -739,7 +774,7 @@
       save(words().filter((_w, k) => k !== Number(b.dataset.rm)));
     }));
     input.addEventListener("keydown", (e) => {
-      if (e.key === "Enter" || e.key === ",") { e.preventDefault(); commit(); }
+      if (e.key === "Enter" || (e.key === "," && CHIP_FIELDS[field].split)) { e.preventDefault(); commit(); }
       else if (e.key === "Backspace" && !input.value && words().length) save(words().slice(0, -1));
     });
     input.addEventListener("blur", () => { if (input.value.trim()) commit(); });
