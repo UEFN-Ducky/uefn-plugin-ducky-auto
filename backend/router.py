@@ -289,6 +289,13 @@ def worth_switching(
     return run(b_in, b_cached, b_out, new_warm, new_write) < run(a_in, a_cached, a_out, stay_warm, stay_write)
 
 
+def login_offering(logins: list[tuple[str, list[str]]], model: str) -> str:
+    """The first signed-in login, as (id, its model ids), that offers ``model`` ("" = none). A gateway
+    pick with no API key runs on a login only under a model name that login knows: Antigravity has
+    no bare gemini-3.8-flash (only -low/-medium/-high), so that step would fail there."""
+    return next((aid for aid, ids in logins if not model or model in ids), "")
+
+
 def parse_route(value: str) -> tuple[str, str]:
     """'anthropic:claude-x' → ('anthropic', 'claude-x'); '' → ('', '') = Auto."""
     v = (value or "").strip()

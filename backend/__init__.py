@@ -22,8 +22,8 @@ from .learn import rank as learned_order
 from .share import ENDPOINT_PATH, MAX_BATCH, event_for
 from .tuner import suggest
 from .router import (
-    TASKS, TIER_RANK, all_tasks, cache_rules, custom_id, explain_task, fits_window, merged_rules, parse_route, pick_tier,
-    rank_tier, tier_count, tier_of, worth_switching,
+    TASKS, TIER_RANK, all_tasks, cache_rules, custom_id, explain_task, fits_window, login_offering, merged_rules,
+    parse_route, pick_tier, rank_tier, tier_count, tier_of, worth_switching,
 )
 
 SELF = "ducky_auto"
@@ -334,7 +334,7 @@ def register(api) -> None:
             else:
                 route_task = task if task != "execution" or not stays_on_turn_model(s, r) else base_task
                 pg, pm = picked(s, route_task)
-                if pg and (blocked := pick_problem(pg)):
+                if pg and (blocked := pick_problem(pg, pm)):
                     row["pick_skipped"] = f"{pg}:{pm}: {blocked}"
                 gateway, model, note, row["failed"] = await first_healthy(route_task, s, r, ctx)
                 if not gateway and current:
@@ -446,7 +446,7 @@ def register(api) -> None:
         pg, pm = picked(s, task)
         tier = r["auto_tier"].get(task, "balanced")
         auto_words = f"Auto: {_TIER_WORDS.get(tier if tier != 'stay' else 'balanced', tier)}"
-        blocked = pick_problem(pg)
+        blocked = pick_problem(pg, pm)
         source = (f"your pick ({pm}) can't run here: {blocked}, so {auto_words}" if blocked
                   else f"your pick for this task ({pm})" if pg else auto_words)
         out = {"ok": True, "task": task, "why": why, "source": source, "picked": f"{pg}:{pm}" if pg else ""}
@@ -505,8 +505,18 @@ def register(api) -> None:
         except Exception:
             return False
 
-    def login_for(gateway: str) -> str:
-        """A signed-in coding agent from the gateway's own plugin (Claude Code for Anthropic)."""
+    def agent_models(aid: str) -> list[str]:
+        try:
+            from backend.agent.coding_agents import detect_all  # cached: no CLI start here
+
+            row = next((a for a in (detect_all() or {}).get("agents") or [] if a.get("id") == aid), {})
+            return [str(m.get("id")) for m in row.get("models") or [] if isinstance(m, dict)]
+        except Exception:
+            return []
+
+    def login_for(gateway: str, model: str = "") -> str:
+        """A signed-in coding agent from the gateway's own plugin (Claude Code for Anthropic) that
+        offers ``model``: Google has two (Gemini CLI, Antigravity) with different model names."""
         try:
             from backend.agent.coding_agents.base import listed_external_coding_agents
             from backend.uefn_plugins.plugin_host.gateways import (
@@ -514,9 +524,9 @@ def register(api) -> None:
             )
 
             pid = (get_llm_provider_registration(gateway) or {}).get("plugin_id")
-            return next((a for a in listed_external_coding_agents()
-                         if pid and (get_coding_agent_registration(a) or {}).get("plugin_id") == pid
-                         and agent_ready(a)), "")
+            ready = [(a, agent_models(a)) for a in listed_external_coding_agents()
+                     if pid and (get_coding_agent_registration(a) or {}).get("plugin_id") == pid and agent_ready(a)]
+            return login_offering(ready, model)
         except Exception:
             return ""
 
@@ -530,7 +540,7 @@ def register(api) -> None:
             return (aid, m) if agent_ready(aid) else None
         if credential(g):
             return None
-        aid = login_for(g)
+        aid = login_for(g, m)
         return (aid, m) if aid else None
 
     def agent_label(aid: str) -> str:
@@ -577,13 +587,13 @@ def register(api) -> None:
 
         threading.Thread(target=go, daemon=True, name="ducky-auto-handoff").start()
 
-    def pick_problem(gateway: str) -> str:
+    def pick_problem(gateway: str, model: str = "") -> str:
         """Why a picked model's gateway can't run here ("" = it can)."""
         if not gateway:
             return ""
         if aid := agent_of(gateway):
             return "" if agent_ready(aid) else f"{agent_label(aid)} isn't installed or signed in"
-        if not credential(gateway) and login_for(gateway):
+        if not credential(gateway) and login_for(gateway, model):
             return ""  # runs on the person's login
         from backend.agent.providers import gateway_providers
 
@@ -636,7 +646,7 @@ def register(api) -> None:
                 "picked": {t: f"{g}:{m}" if g else "" for t, (g, m) in picks.items()}, "effort": efforts(),
                 "logins": {t: f"{lp[0]}:{lp[1]}" for t in picks if (lp := login_pick(s, t))},
                 "app_version": app_version(), "version": VERSION,
-                "pick_problems": {t: p for t, (g, _m) in picks.items() if (p := pick_problem(g))}}
+                "pick_problems": {t: p for t, (g, _m) in picks.items() if (p := pick_problem(g, _m))}}
 
     def rule_changes(old: dict, new: dict) -> list[tuple[str, str, str]]:
         """(what, before, after) in plain words, one per changed part, for the History log."""
@@ -858,9 +868,9 @@ def register(api) -> None:
             log_adjust(by, task, before, after, why)
         if old_effort != new_effort:
             log_adjust(by, f"{task} thinking", old_effort or "chat's", new_effort or "chat's", why)
-        g = parse_route(after)[0]
+        g, m = parse_route(after)
         return {"ok": True, "task": task, "model": after or "Auto", "effort": new_effort, "changed": True,
-                "warning": pick_problem(g) if g else ""}
+                "warning": pick_problem(g, m) if g else ""}
 
     def set_gateway(gateway: str = "", by: str = "you") -> dict:
         doc = dict(routes_doc())
@@ -911,7 +921,7 @@ def register(api) -> None:
             if tier == "stay":
                 continue
             current = str(doc.get(task) or "")
-            if keep_my_picks and current and not pick_problem(parse_route(current)[0]):
+            if keep_my_picks and current and not pick_problem(*parse_route(current)):
                 kept[task] = current
                 continue
             g, m = winners.get(tier) or winners.get("balanced") or next(iter(winners.values()))

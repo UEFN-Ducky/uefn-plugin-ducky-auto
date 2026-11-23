@@ -135,7 +135,20 @@ def test_custom_rules() -> None:
     assert "my_sound" not in gone["order"] and "my_sound" not in gone["keywords"]
 
 
+def test_a_keyless_pick_only_runs_on_a_login_that_has_the_model() -> None:
+    from router import login_offering
+
+    google = [("gemini_cli", ["auto", "pro", "flash"]),
+              ("antigravity", ["auto", "gemini-3.8-flash-low", "gemini-4-neon-low"])]
+    assert login_offering(google, "gemini-4-neon-low") == "antigravity"
+    assert login_offering(google, "flash") == "gemini_cli"
+    assert login_offering(google, "gemini-3.8-flash") == ""  # neither knows it: the API key's job
+    assert login_offering(google, "") == "gemini_cli"  # no model asked: any signed-in login
+    assert login_offering([], "pro") == ""
+
+
 if __name__ == "__main__":
+    test_a_keyless_pick_only_runs_on_a_login_that_has_the_model()
     test_custom_rules()
     test_classify()
     test_person_rules()
