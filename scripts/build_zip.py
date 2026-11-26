@@ -7,7 +7,7 @@ Two build paths:
   backend to a Windows extension module (no Python source ships) and minifies web
   assets. The engine lives in the UEFN-Ducky checkout, found via ``DUCKY_REPO`` or
   a sibling path.
-- ``--target linux-x86_64|linux-arm64``: the compiled build on that Linux host (Nuitka
+- ``--target linux-x86_64|linux-arm64|macos-arm64|macos-x64``: the compiled build on that host (Nuitka
   can't cross-compile). The engine tags ``python_abi`` in the manifest; the zip name
   carries the target.
 """
@@ -94,16 +94,21 @@ def _find_ducky_repo() -> Path:
     )
 
 
-TARGETS = ("linux-x86_64", "linux-arm64")
+TARGETS = ("linux-x86_64", "linux-arm64", "macos-arm64", "macos-x64")
 
 
 def _host_target() -> str:
-    """'linux-x86_64' / 'linux-arm64' on a Linux host, '' elsewhere (Windows builds stay untagged)."""
+    """'linux-x86_64' / 'linux-arm64' on Linux, 'macos-arm64' / 'macos-x64' on a Mac, '' elsewhere
+    (Windows builds stay untagged)."""
     import platform
 
     arch = platform.machine().lower()
     arch = {"amd64": "x86_64", "aarch64": "arm64"}.get(arch, arch)
-    return f"linux-{arch}" if sys.platform.startswith("linux") else ""
+    if sys.platform.startswith("linux"):
+        return f"linux-{arch}"
+    if sys.platform == "darwin":
+        return "macos-" + {"x86_64": "x64"}.get(arch, arch)
+    return ""
 
 
 def _ducky_python(repo: Path, target: str = "") -> str:
